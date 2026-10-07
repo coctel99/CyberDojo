@@ -1,0 +1,12 @@
+[project]
+name = "cyberdojo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.5.3",
+    "onnxruntime>=1.30.0",
+    "opencv-python>=5.0.0.93",
+    "rtmlib>=0.0.16",
+]
