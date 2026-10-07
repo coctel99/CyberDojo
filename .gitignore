@@ -11,4 +11,5 @@ wheels/
 
 # Large media and generated data
 *.mp4
+*.csv
 data/

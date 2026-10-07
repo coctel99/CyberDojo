@@ -1,49 +1,43 @@
+import argparse
+import csv
 from pathlib import Path
 from time import perf_counter
 
 import cv2
 
-from rtmlib import RTMPose, Wholebody, draw_skeleton
-# from rtmlib import YOLOX
+from models.registry import MODELS, create_model
+from utils import (
+    METRIC_COLUMNS,
+    compute_metrics,
+    draw_angle_text,
+    draw_point,
+    draw_text,
+    extract_points,
+    point_value,
+    resize_for_preview,
+    safe_value,
+)
 
 VIDEO_NAME = "video.mp4"
-OUTPUT_NAME = "pose_output.mp4"
-
-BACKEND = "onnxruntime"
-
-POSE_DEVICE = "mps"
-# DETECTOR_DEVICE = "cpu"
-
-MODEL_MODE = "balanced"
-KEYPOINT_THRESHOLD = 0.4
+DEFAULT_MODEL = MODELS.SPINEPOSE
 
 
-def resize_for_preview(frame, max_width=900, max_height=900):
-    height, width = frame.shape[:2]
-
-    scale = min(
-        max_width / width,
-        max_height / height,
-        1.0,
-    )
-
-    if scale == 1.0:
-        return frame
-
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-
-    return cv2.resize(
-        frame,
-        (new_width, new_height),
-        interpolation=cv2.INTER_AREA,
-    )
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=list(MODELS), default=DEFAULT_MODEL)
+    parser.add_argument("--video", default=VIDEO_NAME)
+    parser.add_argument("--no-preview", action="store_true")
+    parser.add_argument("--max-frames", type=int, default=None)
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
     script_dir = Path(__file__).resolve().parent
-    video_path = script_dir / VIDEO_NAME
-    output_path = script_dir / OUTPUT_NAME
+
+    video_path = script_dir / args.video
+    output_path = script_dir / f"pose_output_{args.model}.mp4"
+    data_output_path = script_dir / f"motion_data_{args.model}.csv"
 
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -66,36 +60,14 @@ def main():
     print(f"Duration: {duration:.2f} sec")
     print()
 
-    config = Wholebody.MODE[MODEL_MODE]
-
-    # print("Initializing YOLOX detector...")
-    # detector = YOLOX(
-    #     config["det"],
-    #     model_input_size=config["det_input_size"],
-    #     backend=BACKEND,
-    #     device=DETECTOR_DEVICE,
-    # )
-    # print("YOLOX initialized.")
-    # print()
-
-    print("Initializing RTMW pose model...")
-    print(f"Pose device: {POSE_DEVICE}")
-
-    pose_model = RTMPose(
-        config["pose"],
-        model_input_size=config["pose_input_size"],
-        to_openpose=False,
-        backend=BACKEND,
-        device=POSE_DEVICE,
-    )
-
-    print("RTMW initialized.")
+    print(f"Initializing model: {args.model}")
+    model = create_model(args.model)
+    print("Model initialized.")
     print()
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
         str(output_path),
-        fourcc,
+        cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (width, height),
     )
@@ -103,95 +75,91 @@ def main():
     if not writer.isOpened():
         raise RuntimeError(f"Could not create output video: {output_path}")
 
+    joint_columns = [
+        f"{name}_{suffix}"
+        for name in model.keypoints
+        for suffix in ("x", "y", "score")
+    ]
+    csv_columns = ["frame", "time_s", *joint_columns, *METRIC_COLUMNS]
+
     frame_index = 0
     processing_start = perf_counter()
     total_pose_time = 0.0
 
-    while True:
-        ret, frame = cap.read()
+    with open(data_output_path, "w", newline="") as csv_file:
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
+        csv_writer.writeheader()
 
-        if not ret:
-            break
+        while True:
+            ret, frame = cap.read()
 
-        frame_start = perf_counter()
+            if not ret or (args.max_frames and frame_index >= args.max_frames):
+                break
 
-        # detection_start = perf_counter()
-        # bboxes = detector(frame)
-        # detection_time = perf_counter() - detection_start
+            frame_start = perf_counter()
 
-        pose_start = perf_counter()
-        keypoints, scores = pose_model(frame)
+            pose_start = perf_counter()
+            keypoints, scores = model.predict(frame)
+            pose_time = perf_counter() - pose_start
+            total_pose_time += pose_time
 
-        # keypoints, scores = pose_model(
-        #     frame,
-        #     bboxes=bboxes,
-        # )
+            annotated = frame.copy()
 
-        pose_time = perf_counter() - pose_start
-        total_pose_time += pose_time
+            if len(keypoints) > 0:
+                points, point_scores = extract_points(
+                    keypoints[0],
+                    scores[0],
+                    model.keypoints,
+                    model.threshold,
+                )
 
-        annotated = frame.copy()
-        annotated = draw_skeleton(
-            annotated,
-            keypoints,
-            scores,
-            openpose_skeleton=False,
-            kpt_thr=KEYPOINT_THRESHOLD,
-        )
+                metrics, derived = compute_metrics(points)
 
-        frame_time = perf_counter() - frame_start
-        total_fps = 1.0 / frame_time if frame_time > 0 else 0.0
-        pose_fps = 1.0 / pose_time if pose_time > 0 else 0.0
+                row = {
+                    "frame": frame_index,
+                    "time_s": safe_value(frame_index / fps),
+                    **metrics,
+                }
 
-        cv2.putText(
-            annotated,
-            f"Frame {frame_index + 1}/{frame_count}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            annotated,
-            f"Total: {total_fps:.1f} FPS",
-            (20, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            annotated,
-            f"RTMW CoreML: {pose_fps:.1f} FPS",
-            (20, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+                for name, point in points.items():
+                    row[f"{name}_x"] = point_value(point, 0)
+                    row[f"{name}_y"] = point_value(point, 1)
+                    row[f"{name}_score"] = safe_value(point_scores[name])
 
-        writer.write(annotated)
-        preview = resize_for_preview(annotated)
+                csv_writer.writerow(row)
 
-        cv2.imshow(
-            "Fencing Coach - RTMW",
-            preview,
-        )
+                annotated = model.draw(annotated, keypoints, scores)
 
-        frame_index += 1
-        key = cv2.waitKey(1) & 0xFF
+                draw_angle_text(annotated, points["left_elbow"], "L elbow", metrics["left_elbow_angle"])
+                draw_angle_text(annotated, points["right_elbow"], "R elbow", metrics["right_elbow_angle"])
+                draw_angle_text(annotated, points["left_knee"], "L knee", metrics["left_knee_angle"])
+                draw_angle_text(annotated, points["right_knee"], "R knee", metrics["right_knee_angle"])
 
-        if key in (ord("q"), 27):
-            break
+                draw_point(annotated, derived["pelvis_center"], "pelvis")
+
+            frame_time = perf_counter() - frame_start
+            total_fps = 1.0 / frame_time if frame_time > 0 else 0
+            pose_fps = 1.0 / pose_time if pose_time > 0 else 0
+
+            draw_text(annotated, f"Frame {frame_index + 1}/{frame_count}", (20, 40))
+            draw_text(annotated, f"Total: {total_fps:.1f} FPS", (20, 70))
+            draw_text(annotated, f"{model.label}: {pose_fps:.1f} FPS", (20, 100))
+
+            writer.write(annotated)
+
+            frame_index += 1
+
+            if not args.no_preview:
+                cv2.imshow(f"Fencing Coach - {model.label}", resize_for_preview(annotated))
+
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
 
     processing_time = perf_counter() - processing_start
 
     cap.release()
     writer.release()
+    model.close()
     cv2.destroyAllWindows()
 
     average_fps = frame_index / processing_time if processing_time > 0 else 0
@@ -202,8 +170,10 @@ def main():
     print(f"Processed frames: {frame_index}")
     print(f"Processing time: {processing_time:.2f} sec")
     print(f"Average total FPS: {average_fps:.2f}")
-    print(f"Average RTMW time: {avg_pose_ms:.1f} ms")
-    print(f"Output: {output_path}")
+    print(f"Average {model.label} time: {avg_pose_ms:.1f} ms")
+    print()
+    print(f"Video output: {output_path}")
+    print(f"Motion data: {data_output_path}")
 
 
 if __name__ == "__main__":
